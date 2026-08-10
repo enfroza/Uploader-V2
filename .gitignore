@@ -1,0 +1,6 @@
+/target
+.env
+seen_videos.txt
+__pycache__/
+*.pyc
+*.cookies.txt
