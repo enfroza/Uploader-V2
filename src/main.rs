@@ -32,22 +32,22 @@ async fn main() {
         let semaphore = Arc::clone(&semaphore);
 
         async move {
-            if let Some(text) = msg.text() {
-                if text.contains("tiktok.com") {
-                    if let Err(e) = handle_tiktok_link(bot, msg, text.to_string(), downloader, semaphore).await {
-                        log::error!("Error processing TikTok request: {:?}", e);
-                    }
-                } else if text.starts_with("/start") {
-                    let _ = bot
-                        .send_message(
-                            msg.chat.id,
-                            "👋 Send me any TikTok video link, and I will download and send it to you without watermarks!",
-                        )
-                        .await;
-                }
+    if let Some(text) = msg.text().map(|s| s.to_string()) {
+        if text.contains("tiktok.com") {
+            if let Err(e) = handle_tiktok_link(bot, msg, text, downloader, semaphore).await {
+                log::error!("Error processing TikTok request: {:?}", e);
             }
-            Ok(())
+        } else if text.starts_with("/start") {
+            let _ = bot
+                .send_message(
+                    msg.chat.id,
+                    "👋 Send me any TikTok video link, and I will download and send it to you without watermarks!",
+                )
+                .await;
         }
+    }
+    Ok(())
+}
     })
     .await;
 }
