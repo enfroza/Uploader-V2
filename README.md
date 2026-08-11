@@ -10,7 +10,7 @@ Supports:
 Example direct URL that works:
 
 ```
-https://jilhub.org/contents/videos/11000/11058/11058.mp4
+https://example.com/contents/videos/11234/11058/11058.mp4
 ```
 
 This version is completely free of Python, `yt-dlp`, and any external sub-processes. Idle memory usage is typically ~15–30 MB.
