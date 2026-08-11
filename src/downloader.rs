@@ -5,7 +5,7 @@ use tokio::time::timeout;
 
 const TIKWM_API_URL: &str = "https://www.tikwm.com/api/";
 const TIKWM_BASE_URL: &str = "https://www.tikwm.com";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Deserialize)]
 pub struct TikWmResponse {
@@ -18,9 +18,9 @@ pub struct TikWmResponse {
 pub struct TikWmData {
     pub id: Option<String>,
     pub title: Option<String>,
-    pub play: Option<String>,    // Direct video stream URL (no watermark)
-    pub hdplay: Option<String>,  // HD video stream URL if available
-    pub size: Option<u64>,       // Video size in bytes
+    pub play: Option<String>,
+    pub hdplay: Option<String>,
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,16 +34,13 @@ pub struct Downloader {
     client: reqwest::Client,
 }
 
-/// Extract a sensible Referer (origin) from a full video URL.
-/// e.g. https://jilhub.org/contents/videos/11000/11058/11058.mp4 → https://jilhub.org/
+/// Extract origin (scheme + host) for a proper Referer/Origin.
 fn origin_from_url(url: &str) -> String {
     if let Ok(parsed) = url::Url::parse(url) {
         if let Some(host) = parsed.host_str() {
-            let scheme = parsed.scheme();
-            return format!("{}://{}/", scheme, host);
+            return format!("{}://{}/", parsed.scheme(), host);
         }
     }
-    // Fallback: just use the URL itself
     url.to_string()
 }
 
@@ -51,23 +48,28 @@ impl Downloader {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
+            .connect_timeout(Duration::from_secs(20))
             .user_agent(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
                  AppleWebKit/537.36 (KHTML, like Gecko) \
-                 Chrome/120.0.0.0 Safari/537.36",
+                 Chrome/122.0.0.0 Safari/537.36",
             )
             .redirect(reqwest::redirect::Policy::limited(10))
             .gzip(true)
             .brotli(true)
+            // Prefer HTTP/1.1 – some Cloudflare configs treat pure HTTP/2 clients more strictly
+            .http1_only()
+            .pool_max_idle_per_host(2)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
         Self { client }
     }
 
-    /// Shared browser-like headers that help bypass simple Cloudflare / hotlink protection.
     fn browser_headers(video_url: &str) -> reqwest::header::HeaderMap {
-        use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, REFERER, ORIGIN};
+        use reqwest::header::{
+            HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, ORIGIN, REFERER,
+        };
 
         let mut headers = HeaderMap::new();
         let origin = origin_from_url(video_url);
@@ -77,43 +79,32 @@ impl Downloader {
             ACCEPT_LANGUAGE,
             HeaderValue::from_static("en-US,en;q=0.9"),
         );
+
         if let Ok(v) = HeaderValue::from_str(&origin) {
             headers.insert(REFERER, v.clone());
-            // Some CDNs also check Origin
             headers.insert(ORIGIN, v);
         }
-        // Extra headers that real browsers send for media
+
+        // Realistic Chrome client hints
         headers.insert(
-            "Sec-Fetch-Dest",
-            HeaderValue::from_static("video"),
-        );
-        headers.insert(
-            "Sec-Fetch-Mode",
-            HeaderValue::from_static("no-cors"),
-        );
-        headers.insert(
-            "Sec-Fetch-Site",
-            HeaderValue::from_static("same-origin"),
-        );
-        headers.insert(
-            "Sec-Ch-Ua",
+            "sec-ch-ua",
             HeaderValue::from_static(
-                r#""Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120""#,
+                r#""Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122""#,
             ),
         );
+        headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
         headers.insert(
-            "Sec-Ch-Ua-Mobile",
-            HeaderValue::from_static("?0"),
-        );
-        headers.insert(
-            "Sec-Ch-Ua-Platform",
+            "sec-ch-ua-platform",
             HeaderValue::from_static(r#""Windows""#),
         );
+        headers.insert("sec-fetch-dest", HeaderValue::from_static("video"));
+        headers.insert("sec-fetch-mode", HeaderValue::from_static("no-cors"));
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        headers.insert("priority", HeaderValue::from_static("u=1, i"));
 
         headers
     }
 
-    /// Fetches TikTok video metadata via TikWM API
     pub async fn fetch_video_info(&self, tiktok_url: &str) -> Result<VideoInfo> {
         let params = [("url", tiktok_url), ("hd", "1")];
 
@@ -121,7 +112,7 @@ impl Downloader {
 
         let response = match timeout(HTTP_TIMEOUT, req).await {
             Ok(res) => res?,
-            Err(_) => return Err(anyhow!("Request to TikWM API timed out after 60 seconds")),
+            Err(_) => return Err(anyhow!("Request to TikWM API timed out after 90 seconds")),
         };
 
         if !response.status().is_success() {
@@ -139,7 +130,6 @@ impl Downloader {
             .data
             .ok_or_else(|| anyhow!("TikWM API returned no data payload"))?;
 
-        // Use HD play URL if present, fallback to standard play URL
         let raw_url = data
             .hdplay
             .filter(|s| !s.is_empty())
@@ -159,23 +149,17 @@ impl Downloader {
         })
     }
 
-    /// Probes a direct video URL (HEAD request) to get Content-Length when available.
     pub async fn probe_direct_url(&self, video_url: &str) -> Result<Option<u64>> {
         let headers = Self::browser_headers(video_url);
 
-        let req = self
-            .client
-            .head(video_url)
-            .headers(headers)
-            .send();
+        let req = self.client.head(video_url).headers(headers).send();
 
         let response = match timeout(HTTP_TIMEOUT, req).await {
             Ok(res) => res?,
-            Err(_) => return Err(anyhow!("HEAD request timed out after 60 seconds")),
+            Err(_) => return Err(anyhow!("HEAD request timed out after 90 seconds")),
         };
 
         if !response.status().is_success() {
-            // Some hosts reject HEAD; fall back to letting the GET handle it
             log::debug!(
                 "HEAD probe for {} returned {}, will try full GET",
                 video_url,
@@ -187,31 +171,26 @@ impl Downloader {
         Ok(response.content_length())
     }
 
-    /// Downloads the video bytes with a strict size cap to protect RAM/disk.
-    /// Works for both TikWM-resolved URLs and arbitrary direct .mp4 links.
     pub async fn download_video_bytes(&self, video_url: &str, max_bytes: u64) -> Result<Vec<u8>> {
         let headers = Self::browser_headers(video_url);
 
-        let req = self
-            .client
-            .get(video_url)
-            .headers(headers)
-            .send();
+        let req = self.client.get(video_url).headers(headers).send();
 
         let response = match timeout(HTTP_TIMEOUT, req).await {
             Ok(res) => res?,
-            Err(_) => return Err(anyhow!("Video download timed out after 60 seconds")),
+            Err(_) => return Err(anyhow!("Video download timed out after 90 seconds")),
         };
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if !status.is_success() {
             return Err(anyhow!(
                 "Failed to download video stream, HTTP status: {} \
-                 (site may be blocking the request or require cookies)",
-                response.status()
+                 (Cloudflare or the site is blocking this server IP / request fingerprint. \
+                 Try from a residential IP or a different VPS.)",
+                status
             ));
         }
 
-        // Check Content-Length header if provided by server
         if let Some(content_length) = response.content_length() {
             if content_length > max_bytes {
                 return Err(anyhow!(
