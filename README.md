@@ -1,81 +1,92 @@
 # Uploader-V2
 
-A lightweight, high-performance Telegram bot written in **100% pure Rust**.
+Telegram bot that downloads TikTok videos and **direct video URLs** (including Cloudflare-protected sites).
 
-Supports:
+- TikTok → pure Rust (TikWM API)
+- Direct URLs → tries fast HTTP first, falls back to **low-memory Playwright** on 403
 
-1. **TikTok links** → watermark-free MP4 via TikWM API  
-2. **Direct video URLs** (`.mp4`, `.webm`, etc.) → download and upload to Telegram  
-
-Example direct URL that works:
-
-```
-https://example.com/contents/videos/11234/11058/11058.mp4
-```
-
-This version is completely free of Python, `yt-dlp`, and any external sub-processes. Idle memory usage is typically ~15–30 MB.
+Optimized for **4 GB RAM** instances (max 1 concurrent download).
 
 ---
 
-## Key Features
+## Features
 
-* **100% Pure Rust**: `tokio` + `teloxide` + `reqwest` only.
-* **TikTok watermark-free extraction** via public TikWM API.
-* **Direct video download** for any public HTTP(S) media link (`.mp4`, `.webm`, `.mkv`, `.mov`, `.m4v` or paths containing `/videos/`).
-* **Low-RAM protection**: `tokio::sync::Semaphore` limits concurrent downloads to 2.
-* **Telegram 50 MB safeguard** (checked via Content-Length when available + final size check).
-* **Strict temp-file cleanup** with UUID filenames.
-* **60-second HTTP timeouts** on all network operations.
-* Follows redirects (up to 10) so signed/CDN links still work.
+* TikTok watermark-free download (pure Rust)
+* Direct `.mp4` / `.webm` / etc. support
+* Automatic Playwright fallback for Cloudflare 403s
+* Memory-conscious (concurrency = 1, heavy Chromium flags, resource blocking)
+* Telegram 50 MB limit enforced
+* Strict temp-file cleanup
 
 ---
 
-## Project Structure
+## Requirements
 
-```text
-Uploader-V2/
-├── Cargo.toml
-├── .env.example
-├── .gitignore
-└── src/
-    ├── main.rs          # Bot entry point & routing
-    ├── telegram.rs      # TikTok + direct-URL handlers
-    └── downloader.rs    # HTTP client (TikWM + direct downloads)
-```
+- Rust (1.75+)
+- Node.js 18+
+- ~1 GB free RAM while downloading
 
 ---
 
 ## Setup
 
 ```bash
+# 1. Clone / enter project
+cd Uploader-V2
+
+# 2. Install Node dependencies + Chromium
+cd playwright-downloader
+npm install
+npx playwright install chromium
+cd ..
+
+# 3. Configure bot token
 cp .env.example .env
-# Edit .env and put your Telegram bot token
+# Edit .env → put your TELOXIDE_TOKEN
+
+# 4. Run
 cargo run --release
 ```
 
-Required environment variable:
+---
 
-```
-TELOXIDE_TOKEN=your_telegram_bot_token_here
-```
+## Environment variables
 
-(or `TELEGRAM_BOT_TOKEN`)
+```env
+TELOXIDE_TOKEN=your_bot_token_here
+RUST_LOG=info
+
+# Optional
+DIRECT_VIDEO_COOKIES=cf_clearance=...
+PLAYWRIGHT_SCRIPT=./playwright-downloader/download.js
+```
 
 ---
 
-## Usage
+## How it works
 
-Send the bot either:
+1. You send a TikTok link or a direct video URL
+2. For direct URLs the bot first tries a normal HTTP download (very light)
+3. If the site returns **403 Forbidden**, it automatically launches a memory-optimized Playwright (Chromium) instance, downloads the video, then closes the browser
+4. Video is uploaded to Telegram and temp files are deleted
 
-* A TikTok share link, **or**
-* A direct video URL (must start with `http://` or `https://` and end with a video extension / contain `/videos/`)
+Only **one** download runs at a time to stay safe on 4 GB RAM.
 
-The bot replies with the video file (or an error message if the file exceeds 50 MB or the download fails).
+---
+
+## Memory usage (approximate)
+
+| State                    | RAM        |
+|--------------------------|------------|
+| Idle (Rust only)         | 20–40 MB   |
+| HTTP download            | 40–80 MB   |
+| Playwright download      | 450–700 MB |
+| Peak (safe)              | < 1 GB     |
 
 ---
 
 ## Notes
 
-* Direct downloads rely on the remote server allowing the bot’s User-Agent and not requiring cookies/auth.
-* Some hosts block HEAD requests — the bot falls back to a full GET and still enforces the size limit after download.
-* All temporary files are deleted immediately after upload (or on error).
+* Playwright is only used when normal HTTP gets blocked.
+* Chromium is closed immediately after each download.
+* For best results on heavily protected sites, a residential IP still helps, but Playwright solves most Cloudflare challenges.
