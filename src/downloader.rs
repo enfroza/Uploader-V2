@@ -228,6 +228,8 @@ impl Downloader {
             .arg("best[ext=mp4]/best[ext=webm]/best")
             .arg("--max-filesize")
             .arg(format!("{}M", max_bytes / (1024 * 1024)))
+            .arg("--extractor-args")
+            .arg("generic:impersonate")
             .arg("-o")
             .arg(&out_template_str)
             .arg(video_url)
@@ -242,7 +244,7 @@ impl Downloader {
             }
         }
 
-        // Optional extra args from env
+        // Optional extra args from env (can override / add more)
         if let Ok(extra) = env::var("YTDLP_ARGS") {
             for arg in extra.split_whitespace() {
                 cmd.arg(arg);
