@@ -3,15 +3,11 @@
  * Low-memory Playwright video downloader
  * Usage: node download.js <video_url> <output_path>
  *
- * Optimized for ~4GB RAM instances:
- * - Single browser, single context
- * - Blocks images / CSS / fonts
- * - Aggressive Chrome flags
+ * Optimized for ~4GB RAM instances.
  */
 
 const { chromium } = require('playwright');
 const fs = require('fs');
-const path = require('path');
 
 const url = process.argv[2];
 const outputPath = process.argv[3];
@@ -21,7 +17,7 @@ if (!url || !outputPath) {
   process.exit(1);
 }
 
-const MAX_SIZE = 50 * 1024 * 1024; // 50 MB Telegram limit
+const MAX_SIZE = 50 * 1024 * 1024; // 50 MB
 
 (async () => {
   let browser = null;
@@ -42,7 +38,6 @@ const MAX_SIZE = 50 * 1024 * 1024; // 50 MB Telegram limit
         '--disable-features=TranslateUI,BlinkGenPropertyTrees',
         '--disable-ipc-flooding-protection',
         '--disable-renderer-backgrounding',
-        '--force-color-profile=srgb',
         '--metrics-recording-only',
         '--mute-audio',
         '--no-default-browser-check',
@@ -54,7 +49,6 @@ const MAX_SIZE = 50 * 1024 * 1024; // 50 MB Telegram limit
         '--disable-client-side-phishing-detection',
         '--disable-component-update',
         '--disable-default-apps',
-        '--disable-features=AudioServiceOutOfProcess',
         '--memory-pressure-off',
         '--js-flags=--max-old-space-size=256',
       ],
@@ -68,93 +62,112 @@ const MAX_SIZE = 50 * 1024 * 1024; // 50 MB Telegram limit
       ignoreHTTPSErrors: true,
     });
 
-    // Block heavy resources to save RAM & bandwidth
-    await context.route('**/*', (route) => {
-      const type = route.request().resourceType();
-      if (['image', 'stylesheet', 'font', 'media', 'texttrack', 'manifest'].includes(type)) {
-        return route.abort();
-      }
-      return route.continue();
-    });
+    // ---------- Method 1: Direct request (best for .mp4 links) ----------
+    try {
+      const origin = new URL(url).origin + '/';
+      const resp = await context.request.get(url, {
+        timeout: 120000,
+        headers: {
+          'Accept': '*/*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Referer': origin,
+          'Origin': origin.replace(/\/$/, ''),
+          'Sec-Fetch-Dest': 'video',
+          'Sec-Fetch-Mode': 'no-cors',
+          'Sec-Fetch-Site': 'same-origin',
+        },
+      });
 
+      if (resp.ok()) {
+        const buffer = await resp.body();
+        if (buffer.length === 0) throw new Error('Empty body');
+        if (buffer.length > MAX_SIZE) {
+          throw new Error(`File too large: ${(buffer.length / 1024 / 1024).toFixed(2)} MB > 50 MB`);
+        }
+        fs.writeFileSync(outputPath, buffer);
+        console.log(JSON.stringify({ ok: true, size: buffer.length, path: outputPath, method: 'request' }));
+        return;
+      }
+      // If not ok, fall through to page method
+      console.error(`Direct request got HTTP ${resp.status()}, trying page method...`);
+    } catch (e) {
+      console.error(`Direct request failed: ${e.message}, trying page method...`);
+    }
+
+    // ---------- Method 2: Page navigation + response listener ----------
     const page = await context.newPage();
 
-    // Prefer direct navigation to the video URL
-    const response = await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: 60000,
+    // Capture the main response before it can be closed
+    let mainBuffer = null;
+    let mainStatus = 0;
+    let mainContentType = '';
+
+    page.on('response', async (response) => {
+      try {
+        if (response.url() === url || response.url().split('?')[0] === url.split('?')[0]) {
+          mainStatus = response.status();
+          mainContentType = response.headers()['content-type'] || '';
+          if (mainStatus >= 200 && mainStatus < 400) {
+            mainBuffer = await response.body();
+          }
+        }
+      } catch (_) {
+        // ignore body already closed errors on secondary responses
+      }
     });
 
-    if (!response) {
-      throw new Error('No response received');
-    }
+    await page.goto(url, {
+      waitUntil: 'commit',   // don't wait for full load
+      timeout: 90000,
+    });
 
-    const status = response.status();
-    if (status >= 400) {
-      throw new Error(`HTTP ${status}`);
-    }
+    // Give the response listener a moment
+    await page.waitForTimeout(1500);
 
-    const contentType = response.headers()['content-type'] || '';
-
-    // Case 1: Direct video response
-    if (contentType.includes('video') || contentType.includes('octet-stream') || url.match(/\.(mp4|webm|mkv|mov|m4v)(\?|$)/i)) {
-      const buffer = await response.body();
-      if (buffer.length > MAX_SIZE) {
-        throw new Error(`File too large: ${(buffer.length / 1024 / 1024).toFixed(2)} MB > 50 MB`);
+    if (mainBuffer && mainBuffer.length > 0) {
+      if (mainBuffer.length > MAX_SIZE) {
+        throw new Error(`File too large: ${(mainBuffer.length / 1024 / 1024).toFixed(2)} MB > 50 MB`);
       }
-      if (buffer.length === 0) {
-        throw new Error('Empty file');
-      }
-      fs.writeFileSync(outputPath, buffer);
-      console.log(JSON.stringify({ ok: true, size: buffer.length, path: outputPath }));
+      fs.writeFileSync(outputPath, mainBuffer);
+      console.log(JSON.stringify({ ok: true, size: mainBuffer.length, path: outputPath, method: 'page-response' }));
       return;
     }
 
-    // Case 2: HTML page – try to find a video source
-    // Wait a bit for possible JS redirects / players
+    // ---------- Method 3: Look for <video> src on HTML pages ----------
     await page.waitForTimeout(2000);
 
     const videoSrc = await page.evaluate(() => {
       const video = document.querySelector('video');
       if (video) {
+        if (video.currentSrc) return video.currentSrc;
         if (video.src) return video.src;
         const source = video.querySelector('source');
         if (source && source.src) return source.src;
       }
-      // Common player data attributes
       const el = document.querySelector('[data-video], [data-src], [data-mp4]');
       if (el) {
         return el.getAttribute('data-video') || el.getAttribute('data-src') || el.getAttribute('data-mp4');
       }
       return null;
-    });
+    }).catch(() => null);
 
     if (videoSrc) {
+      const origin = new URL(url).origin + '/';
       const videoResp = await context.request.get(videoSrc, {
-        timeout: 90000,
+        timeout: 120000,
         headers: {
           Referer: url,
+          Origin: origin.replace(/\/$/, ''),
         },
       });
       if (!videoResp.ok()) {
-        throw new Error(`Video fetch failed: HTTP ${videoResp.status()}`);
+        throw new Error(`Video source fetch failed: HTTP ${videoResp.status()}`);
       }
       const buffer = await videoResp.body();
       if (buffer.length > MAX_SIZE) {
         throw new Error(`File too large: ${(buffer.length / 1024 / 1024).toFixed(2)} MB > 50 MB`);
       }
       fs.writeFileSync(outputPath, buffer);
-      console.log(JSON.stringify({ ok: true, size: buffer.length, path: outputPath }));
+      console.log(JSON.stringify({ ok: true, size: buffer.length, path: outputPath, method: 'video-src' }));
       return;
     }
-
-    throw new Error('Could not extract video source from page');
-  } catch (err) {
-    console.error(JSON.stringify({ ok: false, error: err.message }));
-    process.exit(1);
-  } finally {
-    if (browser) {
-      await browser.close().catch(() => {});
-    }
-  }
-})();
