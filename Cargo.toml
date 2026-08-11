@@ -1,12 +1,12 @@
 [package]
 name = "uploader-v2"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
 teloxide = { version = "0.12", features = ["macros"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "gzip", "brotli"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dotenvy = "0.15"
@@ -14,3 +14,4 @@ log = "0.4"
 env_logger = "0.11"
 anyhow = "1.0"
 uuid = { version = "1.8", features = ["v4"] }
+url = "2.5"
