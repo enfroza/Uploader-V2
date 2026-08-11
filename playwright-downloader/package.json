@@ -1,0 +1,12 @@
+{
+  "name": "playwright-downloader",
+  "version": "1.0.0",
+  "description": "Low-memory Playwright video downloader for Cloudflare-protected hosts",
+  "main": "download.js",
+  "scripts": {
+    "download": "node download.js"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
