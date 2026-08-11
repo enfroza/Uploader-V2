@@ -15,7 +15,7 @@ async fn main() {
     dotenv().ok();
     env_logger::init();
 
-    log::info!("Starting Uploader-V2 Bot (Rust + low-memory Playwright fallback)...");
+    log::info!("Starting Uploader-V2 Bot (Rust + yt-dlp fallback)...");
 
     let bot_token = env::var("TELOXIDE_TOKEN")
         .or_else(|_| env::var("TELEGRAM_BOT_TOKEN"))
@@ -23,8 +23,7 @@ async fn main() {
 
     let bot = Bot::new(bot_token);
 
-    // Limit to 1 concurrent download to keep RAM safe on 4 GB instances
-    // (Playwright/Chromium is memory-heavy)
+    // Keep concurrency at 1 for safety on low-RAM VPS
     let semaphore = Arc::new(Semaphore::new(1));
     let downloader = Arc::new(Downloader::new());
 
@@ -55,8 +54,8 @@ async fn main() {
                             "👋 Send me:\n\
 • Any TikTok video link → watermark-free MP4\n\
 • Any direct video URL (e.g. `.mp4`) → download & upload\n\n\
-Protected sites (Cloudflare) are handled automatically via Playwright.\n\
-Only 1 download runs at a time to keep memory low.",
+Protected sites are handled via yt-dlp fallback.\n\
+Only 1 download runs at a time.",
                         )
                         .await;
                 }
