@@ -1,33 +1,81 @@
-# TikTok to Telegram Bot
+# Uploader-V2
 
-A lightweight, high-performance Telegram bot written in **100% pure Rust**. Converts TikTok links sent in chat into direct, watermark-free MP4 video files. 
+A lightweight, high-performance Telegram bot written in **100% pure Rust**.
 
-This version is completely refactored to eliminate all legacy Python dependencies, `yt-dlp` script invocations, and heavy external sub-processes, resulting in minimal idle memory usage (~15–30 MB RAM).
+Supports:
+
+1. **TikTok links** → watermark-free MP4 via TikWM API  
+2. **Direct video URLs** (`.mp4`, `.webm`, etc.) → download and upload to Telegram  
+
+Example direct URL that works:
+
+```
+https://jilhub.org/contents/videos/11000/11058/11058.mp4
+```
+
+This version is completely free of Python, `yt-dlp`, and any external sub-processes. Idle memory usage is typically ~15–30 MB.
 
 ---
 
 ## Key Features
 
-* **100% Pure Rust**: Built using `tokio`, `teloxide`, and `reqwest` with zero Python runtime dependencies or sub-process overhead.
-* **Watermark-Free Extraction**: Queries the public TikWM API directly via async HTTP POST requests to fetch clean MP4 streams.
-* **Low-RAM Protection**: Integrated `tokio::sync::Semaphore` caps simultaneous video downloads (default: 2) to keep memory usage safe on low-spec VPS hosts (e.g., AWS `t3.micro` 1 GiB instances).
-* **Telegram Size Safeguard**: Enforces Telegram’s 50 MB Bot API file limit before attempting heavy downloads.
-* **Strict File Cleanup**: Temp download paths use unique UUID filenames and guarantee removal from disk after sending or on error.
-* **30-Second Request Timeout**: All HTTP metadata and binary stream downloads are bound by explicit timeouts to prevent hung tasks.
+* **100% Pure Rust**: `tokio` + `teloxide` + `reqwest` only.
+* **TikTok watermark-free extraction** via public TikWM API.
+* **Direct video download** for any public HTTP(S) media link (`.mp4`, `.webm`, `.mkv`, `.mov`, `.m4v` or paths containing `/videos/`).
+* **Low-RAM protection**: `tokio::sync::Semaphore` limits concurrent downloads to 2.
+* **Telegram 50 MB safeguard** (checked via Content-Length when available + final size check).
+* **Strict temp-file cleanup** with UUID filenames.
+* **60-second HTTP timeouts** on all network operations.
+* Follows redirects (up to 10) so signed/CDN links still work.
 
 ---
 
 ## Project Structure
 
 ```text
-tiktok-to-telegram/
-├── .github/
-│   └── workflows/
-│       └── deploy.yml        # CI/CD GitHub Actions workflow
-├── Cargo.toml                # Rust dependencies and configuration
-├── .env.example              # Environment variable template
-├── .gitignore                # Ignores target/ and local .env files
+Uploader-V2/
+├── Cargo.toml
+├── .env.example
+├── .gitignore
 └── src/
-    ├── main.rs               # Entry point, bot setup, and semaphore control
-    ├── telegram.rs           # Teloxide update routing & upload handler
-    └── downloader.rs         # Async TikWM API client & binary downloader
+    ├── main.rs          # Bot entry point & routing
+    ├── telegram.rs      # TikTok + direct-URL handlers
+    └── downloader.rs    # HTTP client (TikWM + direct downloads)
+```
+
+---
+
+## Setup
+
+```bash
+cp .env.example .env
+# Edit .env and put your Telegram bot token
+cargo run --release
+```
+
+Required environment variable:
+
+```
+TELOXIDE_TOKEN=your_telegram_bot_token_here
+```
+
+(or `TELEGRAM_BOT_TOKEN`)
+
+---
+
+## Usage
+
+Send the bot either:
+
+* A TikTok share link, **or**
+* A direct video URL (must start with `http://` or `https://` and end with a video extension / contain `/videos/`)
+
+The bot replies with the video file (or an error message if the file exceeds 50 MB or the download fails).
+
+---
+
+## Notes
+
+* Direct downloads rely on the remote server allowing the bot’s User-Agent and not requiring cookies/auth.
+* Some hosts block HEAD requests — the bot falls back to a full GET and still enforces the size limit after download.
+* All temporary files are deleted immediately after upload (or on error).
