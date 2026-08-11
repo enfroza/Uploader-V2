@@ -1,92 +1,78 @@
 # Uploader-V2
 
-Telegram bot that downloads TikTok videos and **direct video URLs** (including Cloudflare-protected sites).
+Telegram bot written in Rust that downloads:
 
-- TikTok → pure Rust (TikWM API)
-- Direct URLs → tries fast HTTP first, falls back to **low-memory Playwright** on 403
+1. **TikTok** links → watermark-free MP4 (pure Rust via TikWM)
+2. **Direct video URLs** → tries fast HTTP, falls back to **yt-dlp**
 
-Optimized for **4 GB RAM** instances (max 1 concurrent download).
+Optimized for low-RAM VPS (concurrency limited to 1).
 
 ---
 
 ## Features
 
-* TikTok watermark-free download (pure Rust)
+* TikTok watermark-free download
 * Direct `.mp4` / `.webm` / etc. support
-* Automatic Playwright fallback for Cloudflare 403s
-* Memory-conscious (concurrency = 1, heavy Chromium flags, resource blocking)
+* Automatic **yt-dlp** fallback when HTTP gets blocked (403)
 * Telegram 50 MB limit enforced
 * Strict temp-file cleanup
+* Low memory usage
 
 ---
 
 ## Requirements
 
-- Rust (1.75+)
-- Node.js 18+
-- ~1 GB free RAM while downloading
+- Rust
+- `yt-dlp`
+- `ffmpeg` (recommended)
 
 ---
 
-## Setup
+## Setup (Ubuntu)
 
 ```bash
-# 1. Clone / enter project
-cd Uploader-V2
+# Install yt-dlp
+sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+sudo chmod a+rx /usr/local/bin/yt-dlp
 
-# 2. Install Node dependencies + Chromium
-cd playwright-downloader
-npm install
-npx playwright install chromium
-cd ..
+# Optional but recommended
+sudo apt install -y ffmpeg
 
-# 3. Configure bot token
+# Project
+cd ~/Uploader-V2   # or clone it
 cp .env.example .env
-# Edit .env → put your TELOXIDE_TOKEN
+nano .env          # put your TELOXIDE_TOKEN
 
-# 4. Run
-cargo run --release
+cargo build --release
+./target/release/uploader-v2
 ```
 
 ---
 
-## Environment variables
+## Environment
 
 ```env
-TELOXIDE_TOKEN=your_bot_token_here
-RUST_LOG=info
+TELOXIDE_TOKEN=your_bot_token
 
 # Optional
 DIRECT_VIDEO_COOKIES=cf_clearance=...
-PLAYWRIGHT_SCRIPT=./playwright-downloader/download.js
+YTDLP_COOKIES=/path/to/cookies.txt
+YTDLP_ARGS=--impersonate chrome
 ```
 
 ---
 
 ## How it works
 
-1. You send a TikTok link or a direct video URL
-2. For direct URLs the bot first tries a normal HTTP download (very light)
-3. If the site returns **403 Forbidden**, it automatically launches a memory-optimized Playwright (Chromium) instance, downloads the video, then closes the browser
+1. You send a TikTok or direct video link
+2. For direct URLs the bot first tries a normal HTTP download
+3. If it fails (403 etc.) it automatically runs `yt-dlp`
 4. Video is uploaded to Telegram and temp files are deleted
-
-Only **one** download runs at a time to stay safe on 4 GB RAM.
-
----
-
-## Memory usage (approximate)
-
-| State                    | RAM        |
-|--------------------------|------------|
-| Idle (Rust only)         | 20–40 MB   |
-| HTTP download            | 40–80 MB   |
-| Playwright download      | 450–700 MB |
-| Peak (safe)              | < 1 GB     |
 
 ---
 
 ## Notes
 
-* Playwright is only used when normal HTTP gets blocked.
-* Chromium is closed immediately after each download.
-* For best results on heavily protected sites, a residential IP still helps, but Playwright solves most Cloudflare challenges.
+* yt-dlp often works better than pure HTTP / Playwright on Cloudflare sites
+* You can pass extra flags with `YTDLP_ARGS`
+* For some sites a cookies.txt (exported from browser) helps
