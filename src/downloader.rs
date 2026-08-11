@@ -37,8 +37,6 @@ pub struct VideoInfo {
 pub struct Downloader {
     client: reqwest::Client,
     cookies: Option<String>,
-    /// Path to the Playwright download script
-    playwright_script: PathBuf,
 }
 
 fn origin_from_url(url: &str) -> String {
@@ -61,16 +59,6 @@ impl Downloader {
             log::info!("DIRECT_VIDEO_COOKIES loaded");
         }
 
-        // Locate playwright script relative to the binary / project
-        let playwright_script = env::var("PLAYWRIGHT_SCRIPT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                // Default: ./playwright-downloader/download.js
-                PathBuf::from("playwright-downloader/download.js")
-            });
-
-        log::info!("Playwright script: {:?}", playwright_script);
-
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .connect_timeout(Duration::from_secs(20))
@@ -87,11 +75,7 @@ impl Downloader {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        Self {
-            client,
-            cookies,
-            playwright_script,
-        }
+        Self { client, cookies }
     }
 
     fn browser_headers(&self, video_url: &str) -> reqwest::header::HeaderMap {
@@ -115,18 +99,6 @@ impl Downloader {
                 headers.insert(COOKIE, v);
             }
         }
-
-        headers.insert(
-            "sec-ch-ua",
-            HeaderValue::from_static(
-                r#""Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122""#,
-            ),
-        );
-        headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
-        headers.insert("sec-ch-ua-platform", HeaderValue::from_static(r#""Windows""#));
-        headers.insert("sec-fetch-dest", HeaderValue::from_static("video"));
-        headers.insert("sec-fetch-mode", HeaderValue::from_static("no-cors"));
-        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
 
         headers
     }
@@ -180,7 +152,7 @@ impl Downloader {
 
         let response = match timeout(HTTP_TIMEOUT, req).await {
             Ok(res) => res?,
-            Err(_) => return Err(anyhow!("HEAD request timed out after 90 seconds")),
+            Err(_) => return Ok(None),
         };
 
         if !response.status().is_success() {
@@ -190,24 +162,16 @@ impl Downloader {
         Ok(response.content_length())
     }
 
-    /// Try normal HTTP download first. On 403 → fall back to Playwright.
+    /// Try normal HTTP first. On failure → fall back to yt-dlp.
     pub async fn download_video_bytes(&self, video_url: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        // 1) Try lightweight HTTP first
         match self.download_via_http(video_url, max_bytes).await {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("403") || msg.contains("Forbidden") {
-                    log::warn!("HTTP 403 – falling back to Playwright for {}", video_url);
-                } else {
-                    // Non-403 errors: still try Playwright as last resort
-                    log::warn!("HTTP download failed ({}), trying Playwright...", msg);
-                }
+                log::warn!("HTTP download failed ({}), falling back to yt-dlp...", e);
             }
         }
 
-        // 2) Playwright fallback (handles Cloudflare)
-        self.download_via_playwright(video_url, max_bytes).await
+        self.download_via_ytdlp(video_url, max_bytes).await
     }
 
     async fn download_via_http(&self, video_url: &str, max_bytes: u64) -> Result<Vec<u8>> {
@@ -249,57 +213,85 @@ impl Downloader {
         Ok(bytes.to_vec())
     }
 
-    async fn download_via_playwright(&self, video_url: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let temp_path = std::env::temp_dir().join(format!(
-            "pw_{}.mp4",
-            uuid::Uuid::new_v4()
-        ));
+    async fn download_via_ytdlp(&self, video_url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let temp_dir = std::env::temp_dir();
+        let out_template = temp_dir.join(format!("ytdlp_{}.%(ext)s", uuid::Uuid::new_v4()));
+        let out_template_str = out_template.to_string_lossy().to_string();
 
-        let script = &self.playwright_script;
-        if !script.exists() {
-            return Err(anyhow!(
-                "Playwright script not found at {:?}. Run: cd playwright-downloader && npm install && npx playwright install chromium",
-                script
-            ));
-        }
+        log::info!("Starting yt-dlp download for {}", video_url);
 
-        log::info!("Starting Playwright download → {:?}", temp_path);
-
-        let output = Command::new("node")
-            .arg(script)
+        let mut cmd = Command::new("yt-dlp");
+        cmd.arg("--no-playlist")
+            .arg("--no-warnings")
+            .arg("--no-progress")
+            .arg("-f")
+            .arg("best[ext=mp4]/best[ext=webm]/best")
+            .arg("--max-filesize")
+            .arg(format!("{}M", max_bytes / (1024 * 1024)))
+            .arg("-o")
+            .arg(&out_template_str)
             .arg(video_url)
-            .arg(&temp_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| anyhow!("Failed to start Playwright: {}. Is Node.js installed?", e))?;
+            .kill_on_drop(true);
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Optional cookies file
+        if let Ok(cookies_file) = env::var("YTDLP_COOKIES") {
+            if !cookies_file.is_empty() {
+                cmd.arg("--cookies").arg(cookies_file);
+            }
+        }
+
+        // Optional extra args from env
+        if let Ok(extra) = env::var("YTDLP_ARGS") {
+            for arg in extra.split_whitespace() {
+                cmd.arg(arg);
+            }
+        }
+
+        let output = timeout(Duration::from_secs(180), cmd.output())
+            .await
+            .map_err(|_| anyhow!("yt-dlp timed out after 180 seconds"))?
+            .map_err(|e| anyhow!("Failed to start yt-dlp: {}. Is yt-dlp installed?", e))?;
+
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
 
         if !output.status.success() {
-            // Clean up partial file
-            let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(anyhow!(
-                "Playwright failed: {} {}",
+                "yt-dlp failed: {} {}",
                 stdout.trim(),
                 stderr.trim()
             ));
         }
 
-        // Parse JSON result
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-            if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                let err = json.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-                return Err(anyhow!("Playwright error: {}", err));
+        // Find the downloaded file (yt-dlp replaces %(ext)s)
+        let parent = out_template.parent().unwrap_or(std::path::Path::new("/tmp"));
+        let prefix = out_template
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("ytdlp_");
+
+        let mut downloaded: Option<PathBuf> = None;
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(prefix) {
+                    downloaded = Some(entry.path());
+                    break;
+                }
             }
         }
 
-        let bytes = tokio::fs::read(&temp_path).await?;
-        let _ = tokio::fs::remove_file(&temp_path).await;
+        let path = downloaded.ok_or_else(|| {
+            anyhow!(
+                "yt-dlp finished but output file not found. stderr: {}",
+                stderr.trim()
+            )
+        })?;
+
+        let bytes = tokio::fs::read(&path).await?;
+        let _ = tokio::fs::remove_file(&path).await;
 
         if bytes.len() as u64 > max_bytes {
             return Err(anyhow!(
@@ -309,10 +301,10 @@ impl Downloader {
         }
 
         if bytes.is_empty() {
-            return Err(anyhow!("Playwright returned empty file"));
+            return Err(anyhow!("yt-dlp returned empty file"));
         }
 
-        log::info!("Playwright download OK – {} bytes", bytes.len());
+        log::info!("yt-dlp download OK – {} bytes", bytes.len());
         Ok(bytes)
     }
 }
