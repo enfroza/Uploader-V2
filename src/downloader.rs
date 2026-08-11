@@ -1,6 +1,10 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
+use std::env;
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::process::Command;
 use tokio::time::timeout;
 
 const TIKWM_API_URL: &str = "https://www.tikwm.com/api/";
@@ -32,9 +36,11 @@ pub struct VideoInfo {
 
 pub struct Downloader {
     client: reqwest::Client,
+    cookies: Option<String>,
+    /// Path to the Playwright download script
+    playwright_script: PathBuf,
 }
 
-/// Extract origin (scheme + host) for a proper Referer/Origin.
 fn origin_from_url(url: &str) -> String {
     if let Ok(parsed) = url::Url::parse(url) {
         if let Some(host) = parsed.host_str() {
@@ -46,6 +52,25 @@ fn origin_from_url(url: &str) -> String {
 
 impl Downloader {
     pub fn new() -> Self {
+        let cookies = env::var("DIRECT_VIDEO_COOKIES")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if cookies.is_some() {
+            log::info!("DIRECT_VIDEO_COOKIES loaded");
+        }
+
+        // Locate playwright script relative to the binary / project
+        let playwright_script = env::var("PLAYWRIGHT_SCRIPT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                // Default: ./playwright-downloader/download.js
+                PathBuf::from("playwright-downloader/download.js")
+            });
+
+        log::info!("Playwright script: {:?}", playwright_script);
+
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .connect_timeout(Duration::from_secs(20))
@@ -57,35 +82,40 @@ impl Downloader {
             .redirect(reqwest::redirect::Policy::limited(10))
             .gzip(true)
             .brotli(true)
-            // Prefer HTTP/1.1 – some Cloudflare configs treat pure HTTP/2 clients more strictly
             .http1_only()
             .pool_max_idle_per_host(2)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        Self { client }
+        Self {
+            client,
+            cookies,
+            playwright_script,
+        }
     }
 
-    fn browser_headers(video_url: &str) -> reqwest::header::HeaderMap {
+    fn browser_headers(&self, video_url: &str) -> reqwest::header::HeaderMap {
         use reqwest::header::{
-            HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, ORIGIN, REFERER,
+            HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, COOKIE, ORIGIN, REFERER,
         };
 
         let mut headers = HeaderMap::new();
         let origin = origin_from_url(video_url);
 
         headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
-        headers.insert(
-            ACCEPT_LANGUAGE,
-            HeaderValue::from_static("en-US,en;q=0.9"),
-        );
+        headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
 
         if let Ok(v) = HeaderValue::from_str(&origin) {
             headers.insert(REFERER, v.clone());
             headers.insert(ORIGIN, v);
         }
 
-        // Realistic Chrome client hints
+        if let Some(ref cookie_str) = self.cookies {
+            if let Ok(v) = HeaderValue::from_str(cookie_str) {
+                headers.insert(COOKIE, v);
+            }
+        }
+
         headers.insert(
             "sec-ch-ua",
             HeaderValue::from_static(
@@ -93,21 +123,16 @@ impl Downloader {
             ),
         );
         headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
-        headers.insert(
-            "sec-ch-ua-platform",
-            HeaderValue::from_static(r#""Windows""#),
-        );
+        headers.insert("sec-ch-ua-platform", HeaderValue::from_static(r#""Windows""#));
         headers.insert("sec-fetch-dest", HeaderValue::from_static("video"));
         headers.insert("sec-fetch-mode", HeaderValue::from_static("no-cors"));
         headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
-        headers.insert("priority", HeaderValue::from_static("u=1, i"));
 
         headers
     }
 
     pub async fn fetch_video_info(&self, tiktok_url: &str) -> Result<VideoInfo> {
         let params = [("url", tiktok_url), ("hd", "1")];
-
         let req = self.client.post(TIKWM_API_URL).form(&params).send();
 
         let response = match timeout(HTTP_TIMEOUT, req).await {
@@ -150,8 +175,7 @@ impl Downloader {
     }
 
     pub async fn probe_direct_url(&self, video_url: &str) -> Result<Option<u64>> {
-        let headers = Self::browser_headers(video_url);
-
+        let headers = self.browser_headers(video_url);
         let req = self.client.head(video_url).headers(headers).send();
 
         let response = match timeout(HTTP_TIMEOUT, req).await {
@@ -160,20 +184,34 @@ impl Downloader {
         };
 
         if !response.status().is_success() {
-            log::debug!(
-                "HEAD probe for {} returned {}, will try full GET",
-                video_url,
-                response.status()
-            );
             return Ok(None);
         }
 
         Ok(response.content_length())
     }
 
+    /// Try normal HTTP download first. On 403 → fall back to Playwright.
     pub async fn download_video_bytes(&self, video_url: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let headers = Self::browser_headers(video_url);
+        // 1) Try lightweight HTTP first
+        match self.download_via_http(video_url, max_bytes).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("403") || msg.contains("Forbidden") {
+                    log::warn!("HTTP 403 – falling back to Playwright for {}", video_url);
+                } else {
+                    // Non-403 errors: still try Playwright as last resort
+                    log::warn!("HTTP download failed ({}), trying Playwright...", msg);
+                }
+            }
+        }
 
+        // 2) Playwright fallback (handles Cloudflare)
+        self.download_via_playwright(video_url, max_bytes).await
+    }
+
+    async fn download_via_http(&self, video_url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let headers = self.browser_headers(video_url);
         let req = self.client.get(video_url).headers(headers).send();
 
         let response = match timeout(HTTP_TIMEOUT, req).await {
@@ -183,12 +221,7 @@ impl Downloader {
 
         let status = response.status();
         if !status.is_success() {
-            return Err(anyhow!(
-                "Failed to download video stream, HTTP status: {} \
-                 (Cloudflare or the site is blocking this server IP / request fingerprint. \
-                 Try from a residential IP or a different VPS.)",
-                status
-            ));
+            return Err(anyhow!("HTTP {}", status));
         }
 
         if let Some(content_length) = response.content_length() {
@@ -214,5 +247,72 @@ impl Downloader {
         }
 
         Ok(bytes.to_vec())
+    }
+
+    async fn download_via_playwright(&self, video_url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let temp_path = std::env::temp_dir().join(format!(
+            "pw_{}.mp4",
+            uuid::Uuid::new_v4()
+        ));
+
+        let script = &self.playwright_script;
+        if !script.exists() {
+            return Err(anyhow!(
+                "Playwright script not found at {:?}. Run: cd playwright-downloader && npm install && npx playwright install chromium",
+                script
+            ));
+        }
+
+        log::info!("Starting Playwright download → {:?}", temp_path);
+
+        let output = Command::new("node")
+            .arg(script)
+            .arg(video_url)
+            .arg(&temp_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| anyhow!("Failed to start Playwright: {}. Is Node.js installed?", e))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success() {
+            // Clean up partial file
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(anyhow!(
+                "Playwright failed: {} {}",
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+
+        // Parse JSON result
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+            if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                let err = json.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                return Err(anyhow!("Playwright error: {}", err));
+            }
+        }
+
+        let bytes = tokio::fs::read(&temp_path).await?;
+        let _ = tokio::fs::remove_file(&temp_path).await;
+
+        if bytes.len() as u64 > max_bytes {
+            return Err(anyhow!(
+                "Downloaded video size ({:.2} MB) exceeds Telegram limit of 50 MB",
+                bytes.len() as f64 / (1024.0 * 1024.0)
+            ));
+        }
+
+        if bytes.is_empty() {
+            return Err(anyhow!("Playwright returned empty file"));
+        }
+
+        log::info!("Playwright download OK – {} bytes", bytes.len());
+        Ok(bytes)
     }
 }
