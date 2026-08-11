@@ -5,7 +5,7 @@ use tokio::time::timeout;
 
 const TIKWM_API_URL: &str = "https://www.tikwm.com/api/";
 const TIKWM_BASE_URL: &str = "https://www.tikwm.com";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Deserialize)]
 pub struct TikWmResponse {
@@ -39,6 +39,7 @@ impl Downloader {
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .redirect(reqwest::redirect::Policy::limited(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -53,7 +54,7 @@ impl Downloader {
 
         let response = match timeout(HTTP_TIMEOUT, req).await {
             Ok(res) => res?,
-            Err(_) => return Err(anyhow!("Request to TikWM API timed out after 30 seconds")),
+            Err(_) => return Err(anyhow!("Request to TikWM API timed out after 60 seconds")),
         };
 
         if !response.status().is_success() {
@@ -91,17 +92,43 @@ impl Downloader {
         })
     }
 
-    /// Downloads the video bytes with a strict size cap to protect RAM/disk
-    pub async fn download_video_bytes(&self, video_url: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let req = self.client.get(video_url).send();
+    /// Probes a direct video URL (HEAD request) to get Content-Length when available.
+    pub async fn probe_direct_url(&self, video_url: &str) -> Result<Option<u64>> {
+        let req = self.client.head(video_url).send();
 
         let response = match timeout(HTTP_TIMEOUT, req).await {
             Ok(res) => res?,
-            Err(_) => return Err(anyhow!("Video download timed out after 30 seconds")),
+            Err(_) => return Err(anyhow!("HEAD request timed out after 60 seconds")),
         };
 
         if !response.status().is_success() {
-            return Err(anyhow!("Failed to download video stream, HTTP status: {}", response.status()));
+            // Some hosts reject HEAD; fall back to letting the GET handle it
+            return Ok(None);
+        }
+
+        Ok(response.content_length())
+    }
+
+    /// Downloads the video bytes with a strict size cap to protect RAM/disk.
+    /// Works for both TikWM-resolved URLs and arbitrary direct .mp4 links.
+    pub async fn download_video_bytes(&self, video_url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let req = self
+            .client
+            .get(video_url)
+            .header("Accept", "*/*")
+            .header("Referer", video_url)
+            .send();
+
+        let response = match timeout(HTTP_TIMEOUT, req).await {
+            Ok(res) => res?,
+            Err(_) => return Err(anyhow!("Video download timed out after 60 seconds")),
+        };
+
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Failed to download video stream, HTTP status: {}",
+                response.status()
+            ));
         }
 
         // Check Content-Length header if provided by server
@@ -121,6 +148,10 @@ impl Downloader {
                 "Downloaded video size ({:.2} MB) exceeds Telegram limit of 50 MB",
                 bytes.len() as f64 / (1024.0 * 1024.0)
             ));
+        }
+
+        if bytes.is_empty() {
+            return Err(anyhow!("Downloaded file is empty"));
         }
 
         Ok(bytes.to_vec())
