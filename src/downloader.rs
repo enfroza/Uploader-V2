@@ -34,16 +34,83 @@ pub struct Downloader {
     client: reqwest::Client,
 }
 
+/// Extract a sensible Referer (origin) from a full video URL.
+/// e.g. https://jilhub.org/contents/videos/11000/11058/11058.mp4 → https://jilhub.org/
+fn origin_from_url(url: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(url) {
+        if let Some(host) = parsed.host_str() {
+            let scheme = parsed.scheme();
+            return format!("{}://{}/", scheme, host);
+        }
+    }
+    // Fallback: just use the URL itself
+    url.to_string()
+}
+
 impl Downloader {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+                 AppleWebKit/537.36 (KHTML, like Gecko) \
+                 Chrome/120.0.0.0 Safari/537.36",
+            )
             .redirect(reqwest::redirect::Policy::limited(10))
+            .gzip(true)
+            .brotli(true)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
         Self { client }
+    }
+
+    /// Shared browser-like headers that help bypass simple Cloudflare / hotlink protection.
+    fn browser_headers(video_url: &str) -> reqwest::header::HeaderMap {
+        use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, REFERER, ORIGIN};
+
+        let mut headers = HeaderMap::new();
+        let origin = origin_from_url(video_url);
+
+        headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
+        headers.insert(
+            ACCEPT_LANGUAGE,
+            HeaderValue::from_static("en-US,en;q=0.9"),
+        );
+        if let Ok(v) = HeaderValue::from_str(&origin) {
+            headers.insert(REFERER, v.clone());
+            // Some CDNs also check Origin
+            headers.insert(ORIGIN, v);
+        }
+        // Extra headers that real browsers send for media
+        headers.insert(
+            "Sec-Fetch-Dest",
+            HeaderValue::from_static("video"),
+        );
+        headers.insert(
+            "Sec-Fetch-Mode",
+            HeaderValue::from_static("no-cors"),
+        );
+        headers.insert(
+            "Sec-Fetch-Site",
+            HeaderValue::from_static("same-origin"),
+        );
+        headers.insert(
+            "Sec-Ch-Ua",
+            HeaderValue::from_static(
+                r#""Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120""#,
+            ),
+        );
+        headers.insert(
+            "Sec-Ch-Ua-Mobile",
+            HeaderValue::from_static("?0"),
+        );
+        headers.insert(
+            "Sec-Ch-Ua-Platform",
+            HeaderValue::from_static(r#""Windows""#),
+        );
+
+        headers
     }
 
     /// Fetches TikTok video metadata via TikWM API
@@ -94,7 +161,13 @@ impl Downloader {
 
     /// Probes a direct video URL (HEAD request) to get Content-Length when available.
     pub async fn probe_direct_url(&self, video_url: &str) -> Result<Option<u64>> {
-        let req = self.client.head(video_url).send();
+        let headers = Self::browser_headers(video_url);
+
+        let req = self
+            .client
+            .head(video_url)
+            .headers(headers)
+            .send();
 
         let response = match timeout(HTTP_TIMEOUT, req).await {
             Ok(res) => res?,
@@ -103,6 +176,11 @@ impl Downloader {
 
         if !response.status().is_success() {
             // Some hosts reject HEAD; fall back to letting the GET handle it
+            log::debug!(
+                "HEAD probe for {} returned {}, will try full GET",
+                video_url,
+                response.status()
+            );
             return Ok(None);
         }
 
@@ -112,11 +190,12 @@ impl Downloader {
     /// Downloads the video bytes with a strict size cap to protect RAM/disk.
     /// Works for both TikWM-resolved URLs and arbitrary direct .mp4 links.
     pub async fn download_video_bytes(&self, video_url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let headers = Self::browser_headers(video_url);
+
         let req = self
             .client
             .get(video_url)
-            .header("Accept", "*/*")
-            .header("Referer", video_url)
+            .headers(headers)
             .send();
 
         let response = match timeout(HTTP_TIMEOUT, req).await {
@@ -126,7 +205,8 @@ impl Downloader {
 
         if !response.status().is_success() {
             return Err(anyhow!(
-                "Failed to download video stream, HTTP status: {}",
+                "Failed to download video stream, HTTP status: {} \
+                 (site may be blocking the request or require cookies)",
                 response.status()
             ));
         }
